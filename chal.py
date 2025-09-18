@@ -1,284 +1,548 @@
 # chal.py
-# Simulador de Combos Rentables - Café y Pizzas El Chal
+# Simulador de Combos Rentables para "Café y Pizzas El Chal"
+# - Carga tu menú (CSV) con columnas: ID, Tipo, Categoría, Producto,
+#   Precio Actual (MXN), Nuevo Precio Sugerido (MXN), PRECIO EN APPS,
+#   PRECIO PARA APPS CON FORMULA, PRECIO MINIMO (las últimas 3 opcionales).
+# - IA (Gemini) para generar combos creativos y rentables (variabilidad alta).
+# - Edición y exportación de combos.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-from typing import Dict, List
+import json, re, random, uuid
+from typing import List, Dict, Any
 
 st.set_page_config(layout="wide", page_title="Simulador de Combos – El Chal", page_icon="🍕")
 
 # =========================
-# Helpers robustos
+# IA: Gemini (opcional)
 # =========================
-def pick_col(df: pd.DataFrame, candidates: List[str], required: bool = True, default=None):
-    """Devuelve la 1ra columna que exista entre 'candidates' (case-sensitive)."""
-    for c in candidates:
-        if c in df.columns:
-            return c
+try:
+    import google.generativeai as genai
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
+    st.warning("⚠️ **Gemini no configurado**: agrega GEMINI_API_KEY en `st.secrets` para habilitar IA.")
+
+def extract_json_block(text: str):
+    """Intenta extraer el primer bloque JSON válido del texto."""
+    if not text:
+        return None
+    # 1) bloque { ... }
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    # 2) bloque [ ... ]
+    m = re.search(r"\[[\s\S]*\]", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return None
+
+def call_gemini(prompt: str) -> Any:
+    """Llama a Gemini (temperatura alta para diversidad). Devuelve JSON si hay, o texto."""
+    if not GEMINI_AVAILABLE:
+        return "IA no disponible."
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Config con aleatoriedad y tokens suficientes
+        gen_cfg = {
+            "temperature": 1.25,
+            "top_p": 0.95,
+            "max_output_tokens": 4096,
+        }
+        resp = model.generate_content(prompt, generation_config=gen_cfg)
+        txt = getattr(resp, "text", "") or ""
+        data = extract_json_block(txt)
+        return data if data is not None else txt
+    except Exception as e:
+        return {"error": f"{e}"}
+
+# =========================
+# Helpers
+# =========================
+def parse_money(series: pd.Series) -> pd.Series:
+    """Convierte '$1,234.50', '1,234', '-' a float."""
+    return pd.to_numeric(
+        series.astype(str).str.replace(r"[^\d\.\-]", "", regex=True).replace({"": np.nan, "nan": np.nan, "-": np.nan}),
+        errors="coerce"
+    )
+
+def pick_col(df: pd.DataFrame, names: List[str], required=True, default=None) -> str:
+    for n in names:
+        if n in df.columns:
+            return n
     if required:
-        raise KeyError(f"No encontré ninguna de estas columnas: {candidates}")
+        raise KeyError(f"No encontré ninguna de estas columnas: {names}")
     return default
 
-def to_num(s):
-    return pd.to_numeric(s, errors="coerce")
-
-def norm_text(s):
-    return str(s).strip().casefold()
-
-@st.cache_data(ttl=1800)
-def load_df(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-    return df
-
-def ensure_cost(df: pd.DataFrame, price_col: str, cost_col: str, default_foodcost: float) -> pd.DataFrame:
-    """Si no hay costo, lo estima con un % de food cost sobre precio."""
-    if cost_col not in df.columns:
-        df[cost_col] = to_num(df[price_col]) * default_foodcost
-    return df
-
-def label_row(row, name_col, size_col):
-    name = str(row[name_col])
-    size = str(row[size_col]) if size_col else ""
-    return f"{name} [{size}]" if size and size.lower() != "nan" else name
-
-def pesos(x): 
+def pesos(x: float) -> str:
     try:
         return f"${x:,.2f}"
     except Exception:
-        return x
+        return str(x)
+
+@st.cache_data(ttl=1800)
+def load_menu(file) -> pd.DataFrame:
+    return pd.read_csv(file)
+
+def costo_estimado_row(price: float, cat: str, cat_cost_pct: Dict[str, float]) -> float:
+    return float(price) * float(cat_cost_pct.get(cat, 0.33))
 
 # =========================
-# UI – Carga de datos
+# UI: carga de menú
 # =========================
-st.title("🍕 Simulador de Combos Rentables – Café y Pizzas *El Chal*")
-st.caption("Arma combos, ajusta precio, simula costos y comisiones, y mide margen / contribución.")
+st.title("🍕 Simulador de Combos Rentables – *El Chal*")
+st.caption("Genera combos con IA o constrúyelos a mano. Ajusta comisiones/costos y exporta.")
 
-left, right = st.columns([2,1])
-with left:
-    uploaded = st.file_uploader("Sube tu CSV de menú / precios", type=["csv"])
-    default_cost_pct = st.slider("Si tu CSV no trae **Costo (MXN)**, ¿qué % de costo estimado usamos?",
-                                 min_value=0.10, max_value=0.60, value=0.35, step=0.01)
-with right:
-    st.info("Columnas flexibles: Precio (MXN)/Precio, Costo (MXN)/Costo, Restaurante/Marca/Origen, Nombre del Producto, Tamaño/Presentación, Categoría/Subcategoría.")
+up_left, up_right = st.columns([2,1])
+with up_left:
+    uploaded = st.file_uploader("Sube tu CSV del menú", type=["csv"])
+with up_right:
+    st.info("Requeridas: **ID, Categoría, Producto, Precio Actual (MXN)**.\n"
+            "Opcionales: *Nuevo Precio Sugerido (MXN), PRECIO EN APPS, PRECIO PARA APPS CON FORMULA, PRECIO MINIMO*.")
 
 if not uploaded:
     st.stop()
 
-df_raw = load_df(uploaded)
+df_raw = load_menu(uploaded)
 
 # =========================
 # Normalización de columnas
 # =========================
 try:
-    price_col = pick_col(df_raw, ["Precio (MXN)", "Precio", "precio"])
-except KeyError:
-    st.error("Tu CSV debe incluir una columna de Precio. Nombres válidos: Precio (MXN) / Precio.")
+    id_col   = pick_col(df_raw, ["ID"])
+    tipo_col = pick_col(df_raw, ["Tipo"], required=False, default=None)
+    cat_col  = pick_col(df_raw, ["Categoría", "Categoria"])
+    prod_col = pick_col(df_raw, ["Producto"])
+    p_actual = pick_col(df_raw, ["Precio Actual (MXN)", "Precio Actual"])
+    p_sug    = pick_col(df_raw, ["Nuevo Precio Sugerido (MXN)", "Nuevo Precio Sugerido"], required=False, default=None)
+    p_apps   = pick_col(df_raw, ["PRECIO EN APPS", "Precio en Apps"], required=False, default=None)
+    p_apps_f = pick_col(df_raw, ["PRECIO PARA APPS CON FORMULA", "Precio para Apps con formula"], required=False, default=None)
+    p_min    = pick_col(df_raw, ["PRECIO MINIMO", "Precio Minimo", "Precio mínimo"], required=False, default=None)
+except KeyError as e:
+    st.error(str(e))
     st.stop()
-
-name_col = pick_col(df_raw, ["Nombre del Producto", "Producto", "Nombre"], required=True)
-brand_col = pick_col(df_raw, ["Restaurante", "Marca", "Origen", "Proveedor"], required=False, default=None)
-size_col = pick_col(df_raw, ["Tamaño", "Presentación", "Tamano", "Size"], required=False, default=None)
-cat_col  = pick_col(df_raw, ["Categoría", "Categoria"], required=False, default=None)
-subcat_col = pick_col(df_raw, ["Subcategoría", "Subcategoria"], required=False, default=None)
-cost_col = pick_col(df_raw, ["Costo (MXN)", "Costo", "costo"], required=False, default="__COSTO_TMP__")
 
 df = df_raw.copy()
-df[price_col] = to_num(df[price_col])
-df = ensure_cost(df, price_col, cost_col, default_cost_pct)
+for c in [p_actual, p_sug, p_apps, p_apps_f, p_min]:
+    if c:
+        df[c] = parse_money(df[c])
 
-# Tag de restaurante
-if brand_col:
-    # Normalizar bandera de El Chal
-    is_el_chal = df[brand_col].astype(str).str.contains("chal", case=False, na=False)
-else:
-    # Si no hay columna de restaurante, asumimos que TODO es de El Chal
-    is_el_chal = pd.Series(True, index=df.index)
-
-df["__display__"] = df.apply(lambda r: label_row(r, name_col, size_col), axis=1)
-
-elchal_df = df.loc[is_el_chal].reset_index(drop=True)
-comp_df   = df.loc[~is_el_chal].reset_index(drop=True)
-
-if elchal_df.empty:
-    st.warning("No detecté productos de *El Chal* (por columna Restaurante/Marca). Tomaré todo el archivo como productos de El Chal.")
-    elchal_df = df.copy()
-    comp_df = df.iloc[0:0].copy()
+# Borrar filas sin producto o sin precio actual numérico
+df = df[df[prod_col].notna()].copy()
+df = df[df[p_actual].notna()].copy()
 
 # =========================
-# Panel – Filtros y constructor de combo
+# Food cost por categoría
 # =========================
-st.subheader("🧩 Construcción del Combo")
+st.markdown("### ⚙️ Parámetros de Costo (Food Cost por categoría)")
+defaults = {
+    "Desayunos": 0.35,
+    "Pizzas Personales": 0.32,
+    "Pizzas Familiares": 0.35,
+    "Hamburguesas": 0.38,
+    "Hot Dogs": 0.32,
+    "Sándwiches": 0.33,
+    "Otros Salados": 0.33,
+    "Pastas": 0.34,
+    "Crepas Saladas": 0.32,
+    "Crepas Dulces": 0.30,
+    "Snacks": 0.30,
+    "Bebidas Calientes": 0.25,
+    "Bebidas Frías": 0.28,
+    "Extras": 0.15
+}
+unique_cats = sorted(df[cat_col].dropna().unique())
+cat_cost_pct: Dict[str, float] = {}
+with st.expander("Ajusta los % por categoría (predeterminados sugeridos)", expanded=False):
+    for cat in unique_cats:
+        base = defaults.get(cat, 0.33)
+        cat_cost_pct[cat] = st.slider(f"{cat}", 0.10, 0.60, float(base), 0.01, key=f"fc_{cat}")
 
-f1, f2, f3 = st.columns(3)
-with f1:
-    cat_sel = st.selectbox("Filtra por **Categoría** (opcional):",
-                           ["(todas)"] + (sorted(elchal_df[cat_col].dropna().unique()) if cat_col else []))
-with f2:
-    subcat_sel = st.selectbox("Filtra por **Subcategoría** (opcional):",
-                              ["(todas)"] + (sorted(elchal_df[subcat_col].dropna().unique()) if subcat_col else []))
-with f3:
-    st.write(" ")
+# =========================
+# Base de precios + costos generales
+# =========================
+st.markdown("### 💵 Base de precios + Costos adicionales")
+base_col_name = st.radio(
+    "Elige la base de precios por producto",
+    ["Precio Actual", "Nuevo Precio Sugerido", "Precio en Apps", "Precio Apps (Fórmula)", "Precio Mínimo"],
+    horizontal=True
+)
 
-mask = pd.Series(True, index=elchal_df.index)
-if cat_col and cat_sel != "(todas)":
-    mask &= elchal_df[cat_col].astype(str).str.strip() == str(cat_sel).strip()
-if subcat_col and subcat_sel != "(todas)":
-    mask &= elchal_df[subcat_col].astype(str).str.strip() == str(subcat_sel).strip()
-
-menu_df = elchal_df.loc[mask].copy()
-if menu_df.empty:
-    st.info("No hay productos con esos filtros. Quita filtros o sube otro CSV.")
+base_map = {
+    "Precio Actual": p_actual,
+    "Nuevo Precio Sugerido": p_sug,
+    "Precio en Apps": p_apps,
+    "Precio Apps (Fórmula)": p_apps_f,
+    "Precio Mínimo": p_min
+}
+base_col = base_map[base_col_name]
+if base_col is None:
+    st.error(f"No existe la columna para **{base_col_name}** en tu CSV.")
     st.stop()
 
-# Selección múltiple
-options = menu_df["__display__"].tolist()
-sel = st.multiselect("Elige los **productos** que integrarán el combo:", options)
+c1, c2, c3 = st.columns(3)
+with c1:
+    app_commission = st.slider("Comisión de app (%)", 0, 35, 0, 1)
+with c2:
+    packaging = st.number_input("Empaque por combo (MXN)", min_value=0.0, value=0.0, step=1.0)
+with c3:
+    other_var = st.number_input("Otros costos variables (MXN)", min_value=0.0, value=0.0, step=1.0)
 
-if not sel:
-    st.info("Selecciona al menos un producto para crear el combo.")
-    st.stop()
-
-# Cantidades por ítem
-st.markdown("#### Cantidades por ítem del combo")
-qty_cols = st.columns([1,4,1,1,1])
-qty_cols[0].markdown("**Cant.**")
-qty_cols[1].markdown("**Producto**")
-qty_cols[2].markdown("**Precio**")
-qty_cols[3].markdown("**Costo**")
-qty_cols[4].markdown("**Subtotal**")
-
-combo_rows = []
-for item in sel:
-    row = menu_df.loc[menu_df["__display__"] == item].iloc[0]
-    p = float(row[price_col])
-    c = float(row[cost_col])
-    q = qty_cols[0].number_input(f"q_{item}", min_value=1, value=1, step=1, label_visibility="collapsed", key=f"qty_{item}")
-    qty_cols[1].write(item)
-    qty_cols[2].write(pesos(p))
-    qty_cols[3].write(pesos(c))
-    qty_cols[4].write(pesos(q*p))
-    combo_rows.append({"Producto": item, "Precio": p, "Costo": c, "Cantidad": q})
-
-combo_df = pd.DataFrame(combo_rows)
-combo_df["Subtotal Precio"] = combo_df["Precio"] * combo_df["Cantidad"]
-combo_df["Subtotal Costo"]  = combo_df["Costo"]  * combo_df["Cantidad"]
-
-st.dataframe(combo_df[["Producto","Cantidad","Precio","Costo","Subtotal Precio","Subtotal Costo"]]
-             .assign(Precio=lambda d: d["Precio"].map(pesos))
-             .assign(Costo=lambda d: d["Costo"].map(pesos))
-             .assign(**{"Subtotal Precio": lambda d: d["Subtotal Precio"].map(pesos),
-                        "Subtotal Costo":  lambda d: d["Subtotal Costo"].map(pesos)}),
-             use_container_width=True)
-
-sum_price = float(combo_df["Subtotal Precio"].sum())
-sum_cost  = float(combo_df["Subtotal Costo"].sum())
+# Catálogo compacto para IA (dict ID -> datos)
+catalog = {}
+for _, r in df.iterrows():
+    pid = str(r[id_col])
+    catalog[pid] = {
+        "id": pid,
+        "categoria": str(r[cat_col]),
+        "producto": str(r[prod_col]),
+        "precio_base": float(r[base_col]) if pd.notna(r[base_col]) else None,
+        "precio_min": float(r[p_min]) if (p_min and pd.notna(r[p_min])) else None
+    }
 
 # =========================
-# Simulación de precio del combo
+# 🔮 Generación de combos con IA
 # =========================
-st.subheader("💵 Precio del Combo y Rentabilidad")
+st.markdown("## 🤖 Generación de combos (IA)")
+left_ai, right_ai = st.columns([2,1])
+with left_ai:
+    n_combos = st.slider("¿Cuántos combos proponer?", 1, 5, 3, 1)
+    objetivos = st.multiselect("Objetivo de la tanda (influye a la IA)", 
+                               ["Alta rentabilidad", "Atracción (precio bajo)", "Ticket medio", "Familias", "Oficina/pareja"],
+                               default=["Alta rentabilidad","Ticket medio"])
+with right_ai:
+    min_items = st.number_input("Mínimo de ítems por combo", 2, 6, 2, 1)
+    max_items = st.number_input("Máximo de ítems por combo", 2, 8, 3, 1)
+    ensure_min_price = st.checkbox("Forzar ≥ suma de precios mínimos", value=True)
 
-left, right = st.columns([2,2])
+ai_note = st.caption("La IA usa alta temperatura y un token aleatorio para que cada tanda sea **diferente**.")
 
-with left:
-    st.markdown("**Estrategia de precio**")
-    mode = st.radio(
-        "¿Cómo fijamos el precio?",
-        ["Descuento vs. precios lista", "Margen objetivo sobre costo"],
-        horizontal=True
-    )
-    if mode == "Descuento vs. precios lista":
-        desc = st.slider("Descuento sobre la suma de precios de lista (%)", 0, 60, 20, 1)
+def price_floor_for_items(items):
+    s = 0.0
+    for it in items:
+        pid = str(it["id"])
+        qty = float(it.get("qty", 1))
+        pm = catalog.get(pid, {}).get("precio_min")
+        if pm:
+            s += pm * qty
+    return s
+
+def eval_combo(items, precio_combo) -> Dict[str, float]:
+    """Calcula totales, costo estimado y margen con los parámetros actuales."""
+    sum_base = 0.0
+    sum_cost = 0.0
+    for it in items:
+        pid = str(it["id"])
+        qty = float(it.get("qty", 1))
+        info = catalog.get(pid)
+        if not info or info.get("precio_base") is None:
+            continue
+        base = float(info["precio_base"])
+        sum_base += base * qty
+        cost = costo_estimado_row(base, info["categoria"], cat_cost_pct)
+        sum_cost += cost * qty
+    commission_cost = precio_combo * (app_commission/100.0)
+    total_cost_combo = sum_cost + packaging + other_var + commission_cost
+    margen_abs = precio_combo - total_cost_combo
+    margen_pct = (margen_abs / precio_combo * 100) if precio_combo > 0 else 0
+    desc_vs_base = (1 - precio_combo / sum_base) * 100 if sum_base > 0 else 0
+    return {
+        "sum_base": sum_base, "sum_cost": sum_cost, "commission_cost": commission_cost,
+        "total_cost_combo": total_cost_combo, "margen_abs": margen_abs, "margen_pct": margen_pct,
+        "desc_vs_base": desc_vs_base
+    }
+
+def heuristic_combos(num=3):
+    """Fallback si IA no disponible: genera combos sencillos con heurística."""
+    rng = random.Random()
+    combos = []
+    cat_principales = [c for c in unique_cats if re.search(r"pizza|hamb|pastas?|hot dog", c, re.I)]
+    ids = list(catalog.keys())
+    for _ in range(num):
+        items = []
+        # principal
+        princ_cats = cat_principales or unique_cats
+        pick_cat = rng.choice(princ_cats)
+        principal_ids = [i for i in ids if catalog[i]["categoria"] == pick_cat]
+        if principal_ids:
+            items.append({"id": rng.choice(principal_ids), "qty": 1})
+        # bebida
+        bebidas = [i for i in ids if re.search(r"bebidas?|coca|agua", catalog[i]["categoria"], re.I)]
+        if bebidas:
+            items.append({"id": rng.choice(bebidas), "qty": 1})
+        # extra (opcional)
+        extras = [i for i in ids if re.search(r"extra|snack|papas|nudos", catalog[i]["categoria"], re.I)]
+        if extras and rng.random() < 0.6:
+            items.append({"id": rng.choice(extras), "qty": 1})
+        # precio objetivo por margen 55% y descuento 15–30% vs base
+        ev = eval_combo(items, 1.0)  # solo para sumar bases y costos
+        if ev["sum_cost"] <= 0 or ev["sum_base"] <= 0:
+            continue
+        p_margin = ev["sum_cost"] / (1 - 0.55)  # margen objetivo 55%
+        p_disc = ev["sum_base"] * (1 - rng.uniform(0.15, 0.30))
+        price = max(p_margin, p_disc)
+        if ensure_min_price:
+            floor_ = price_floor_for_items(items)
+            price = max(price, floor_)
+        ev = eval_combo(items, price)
+        combos.append({
+            "name": f"Combo Heurístico {uuid.uuid4().hex[:4]}",
+            "items": items,
+            "precio_combo": round(price, 2),
+            "metrics": ev,
+            "copy": "Sabor top + bebida a precio irresistible.",
+            "why": "Cobertura de principal + bebida con margen sano y descuento competitivo."
+        })
+    return combos
+
+if st.button("🎲 Generar combos (IA)"):
+    # Contexto para IA: tope 120 ítems para mantener prompt razonable
+    sample_catalog = list(catalog.values())[:120]
+    token_random = uuid.uuid4().hex  # fuerza diversidad
+    prompt = f"""
+Eres experto en pricing y creación de combos para QSR en México.
+Objetivo: propón **{n_combos} combos** creativos, competitivos y rentables para "El Chal".
+Genera SIEMPRE combos distintos entre tandas (diversidad alta). Token aleatorio: {token_random}
+
+Datos:
+- catálogo (hasta 120 ítems): {json.dumps(sample_catalog, ensure_ascii=False)}
+- comisión_app_pct: {app_commission}
+- empaque_mxn: {packaging}
+- otros_costos_mxn: {other_var}
+- base_precios: "{base_col_name}"
+- reglas:
+  * Ítems por combo: entre {min_items} y {max_items}.
+  * Debe haber al menos 1 **principal** (categorías que contienen: pizza, hamburguesa, hot dog, pasta).
+  * **Precio sugerido** ≥ suma de **precios mínimos** si hay (aplícalo).
+  * Margen objetivo final (sobre precio) después de costos y comisión: entre **45% y 65%**.
+  * Descuento atractivo vs suma de precios base: **10% a 35%**.
+  * Evita duplicidades absurdas (2 bebidas iguales salvo versión "familiar").
+  * Nombra el combo de forma **atractiva** y breve (≤ 40 caracteres).
+  * Incluye un **copy** de marketing (< 140 caracteres).
+  * Justifica en 1-2 frases por qué es creativo y competitivo.
+
+Devuelve SOLO JSON con esta forma (sin texto adicional):
+{{
+  "combos": [
+    {{
+      "name": "Combo Ejemplo",
+      "items": [{{"id": "P001", "qty": 1}}, {{"id": "B001", "qty": 2}}],
+      "precio_combo": 249.0,
+      "copy": "Pizza + 2 bebidas a súper precio",
+      "why": "Cobertura familiar y alto valor percibido"
+    }}
+  ]
+}}
+"""
+    out = call_gemini(prompt) if GEMINI_AVAILABLE else {"combos": heuristic_combos(n_combos)}
+    if isinstance(out, dict) and "combos" in out:
+        st.session_state["ai_combos"] = out["combos"]
+    elif isinstance(out, list):
+        st.session_state["ai_combos"] = out
+    else:
+        st.error("La IA no devolvió un JSON válido.")
+        st.write(out)
+
+# Mostrar combos generados
+if "ai_combos" in st.session_state and st.session_state["ai_combos"]:
+    st.subheader("Resultados de la IA")
+    for i, combo in enumerate(st.session_state["ai_combos"], start=1):
+        name = combo.get("name", f"Combo {i}")
+        items = combo.get("items", [])
+        price = float(combo.get("precio_combo", 0))
+        # Ajuste por piso de mínimos
+        if ensure_min_price:
+            floor_ = price_floor_for_items(items)
+            if price < floor_:
+                price = floor_
+        metrics = eval_combo(items, price)
+        colA, colB = st.columns([2,1])
+        with colA:
+            st.markdown(f"### {i}. {name}")
+            rows = []
+            for it in items:
+                pid = str(it.get("id"))
+                qty = float(it.get("qty", 1))
+                info = catalog.get(pid, {})
+                rows.append({
+                    "ID": pid,
+                    "Categoría": info.get("categoria", "—"),
+                    "Producto": info.get("producto", "—"),
+                    "Cant.": qty,
+                    "Precio base": info.get("precio_base", np.nan),
+                    "Precio mínimo": info.get("precio_min", np.nan),
+                })
+            tbl = pd.DataFrame(rows)
+            st.dataframe(
+                tbl.assign(**{
+                    "Precio base":   lambda d: d["Precio base"].map(pesos),
+                    "Precio mínimo": lambda d: d["Precio mínimo"].map(pesos),
+                }),
+                use_container_width=True
+            )
+        with colB:
+            k1, k2 = st.columns(2)
+            k1.metric("Precio combo", pesos(price))
+            k2.metric("Margen", f"{metrics['margen_pct']:.1f}%", pesos(metrics['margen_abs']))
+            k3, k4 = st.columns(2)
+            k3.metric("Desc. vs base", f"{metrics['desc_vs_base']:.1f}%")
+            k4.metric("Costo total", pesos(metrics["total_cost_combo"]))
+            st.caption(f"Comisión app: {pesos(metrics['commission_cost'])}")
+            if combo.get("copy"):
+                st.success(combo["copy"])
+            if combo.get("why"):
+                st.caption(combo["why"])
+            # Botón aplicar combo
+            if st.button(f"✅ Usar este combo ({i})", key=f"apply_{i}"):
+                # Construye combo_df de trabajo
+                work_rows = []
+                for it in items:
+                    pid = str(it.get("id"))
+                    qty = float(it.get("qty", 1))
+                    info = catalog.get(pid, {})
+                    base = info.get("precio_base", 0.0) or 0.0
+                    cost = costo_estimado_row(base, info.get("categoria",""), cat_cost_pct)
+                    work_rows.append({
+                        "ID": pid,
+                        "Categoría": info.get("categoria",""),
+                        "Producto": info.get("producto",""),
+                        "Cantidad": qty,
+                        "Precio base": base,
+                        "Costo estimado": cost,
+                        "Precio mínimo": info.get("precio_min", 0.0),
+                        "Subtotal Precio": qty*base,
+                        "Subtotal Costo": qty*cost
+                    })
+                st.session_state["work_combo_name"] = name
+                st.session_state["work_combo_price"] = price
+                st.session_state["work_combo_items"] = pd.DataFrame(work_rows)
+                st.success("Combo aplicado abajo para edición.")
+
+# =========================
+# ✍️ Editor del combo aplicado / Manual
+# =========================
+st.markdown("---")
+st.header("🛠️ Editor del combo (manual / aplicado)")
+# Si no hay combo aplicado, empieza vacío con selector
+if "work_combo_items" not in st.session_state:
+    st.info("Aún no has aplicado un combo de IA. Puedes **generar** uno arriba o construirlo manualmente.")
+    # Construcción manual rápida
+    with st.expander("Construcción manual rápida"):
+        # Filtros
+        f1, f2 = st.columns(2)
+        with f1:
+            cat_sel = st.selectbox("Filtra por categoría", ["(todas)"] + unique_cats)
+        with f2:
+            search = st.text_input("Busca por texto (Producto contiene)")
+        mask = pd.Series(True, index=df.index)
+        if cat_sel != "(todas)":
+            mask &= df[cat_col] == cat_sel
+        if search:
+            mask &= df[prod_col].astype(str).str.contains(search, case=False, na=False)
+        options = df.loc[mask, id_col].astype(str).tolist()
+        add_ids = st.multiselect("Agrega productos por ID", options)
+        rows = []
+        for pid in add_ids:
+            info = catalog[pid]
+            base = info["precio_base"] or 0.0
+            cost = costo_estimado_row(base, info["categoria"], cat_cost_pct)
+            q = st.number_input(f"Cantidad {pid}", 1, 10, 1, 1, key=f"qty_{pid}")
+            rows.append({
+                "ID": pid, "Categoría": info["categoria"], "Producto": info["producto"],
+                "Cantidad": q, "Precio base": base, "Costo estimado": cost,
+                "Precio mínimo": info.get("precio_min", 0.0),
+                "Subtotal Precio": q*base, "Subtotal Costo": q*cost
+            })
+        if rows:
+            st.session_state["work_combo_items"] = pd.DataFrame(rows)
+            st.session_state["work_combo_price"] = float(sum(r["Subtotal Precio"] for r in rows))
+            st.session_state["work_combo_name"] = "Combo manual"
+        else:
+            st.stop()
+
+# Mostrar/editar combo de trabajo
+work_df = st.session_state["work_combo_items"]
+st.text_input("Nombre del combo", value=st.session_state.get("work_combo_name","Combo"), key="work_combo_name")
+st.dataframe(
+    work_df.assign(**{
+        "Precio base":      lambda d: d["Precio base"].map(pesos),
+        "Costo estimado":   lambda d: d["Costo estimado"].map(pesos),
+        "Subtotal Precio":  lambda d: d["Subtotal Precio"].map(pesos),
+        "Subtotal Costo":   lambda d: d["Subtotal Costo"].map(pesos),
+        "Precio mínimo":    lambda d: d["Precio mínimo"].map(pesos),
+    }),
+    use_container_width=True
+)
+
+sum_price = float(work_df["Subtotal Precio"].sum())
+sum_cost  = float(work_df["Subtotal Costo"].sum())
+sum_min   = float((work_df["Precio mínimo"] * work_df["Cantidad"]).sum()) if "Precio mínimo" in work_df.columns else 0.0
+
+# Definir precio del combo
+colp1, colp2 = st.columns(2)
+with colp1:
+    modo_precio = st.radio("Definir precio del combo", ["Descuento vs base", "Margen objetivo"], horizontal=True)
+    if modo_precio == "Descuento vs base":
+        desc = st.slider("Descuento (%)", 0, 60, 20, 1)
         combo_price = sum_price * (1 - desc/100.0)
     else:
-        target_margin = st.slider("Margen objetivo (sobre precio)", 10, 80, 55, 1)
-        # precio = costo / (1 - margen)
-        combo_price = sum_cost / max(1e-6, (1 - target_margin/100.0))
+        target_margin = st.slider("Margen objetivo (%)", 10, 80, 55, 1)
+        combo_price = sum_cost / max(1e-6, 1 - target_margin/100.0)
+with colp2:
+    enforce_min = st.checkbox("Forzar ≥ suma de precios mínimos", value=True)
+    if enforce_min and combo_price < sum_min:
+        st.warning(f"Ajuste por mínimos: {pesos(sum_min)}")
+        combo_price = sum_min
 
-with right:
-    st.markdown("**Costos adicionales (opcional)**")
-    app_commission = st.slider("Comisión de app de entrega (%)", 0, 35, 0, 1)
-    packaging = st.number_input("Empaque por combo (MXN)", min_value=0.0, value=0.0, step=1.0)
-    other_var = st.number_input("Otros costos variables por combo (MXN)", min_value=0.0, value=0.0, step=1.0)
-
-# Comisión y costos variables
 commission_cost = combo_price * (app_commission/100.0)
 total_cost_combo = sum_cost + packaging + other_var + commission_cost
 margin_abs = combo_price - total_cost_combo
 margin_pct = (margin_abs / combo_price * 100) if combo_price > 0 else 0
-discount_vs_list = (1 - combo_price / sum_price) * 100 if sum_price > 0 else 0
+discount_vs_base = (1 - combo_price / sum_price) * 100 if sum_price > 0 else 0
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Precio de lista (suma)", pesos(sum_price))
-k2.metric("Precio del **combo**", pesos(combo_price), f"{-discount_vs_list:.1f}% vs lista")
-k3.metric("Costo total combo", pesos(total_cost_combo))
-k4.metric("Margen del combo", f"{margin_pct:.1f}%", pesos(margin_abs))
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Suma base", pesos(sum_price))
+m2.metric("Precio combo", pesos(combo_price), f"{-discount_vs_base:.1f}% vs base")
+m3.metric("Costo total", pesos(total_cost_combo))
+m4.metric("Margen", f"{margin_pct:.1f}%", pesos(margin_abs))
 
-# Sensibilidades rápidas
-st.markdown("#### Sensibilidades")
-s1, s2 = st.columns(2)
-with s1:
-    st.write("**Precio ±10%**")
-    for delta in [-10, -5, 0, 5, 10]:
-        p = combo_price * (1 + delta/100.0)
-        m = (p - (sum_cost + packaging + other_var + p*(app_commission/100.0))) / p * 100 if p>0 else 0
-        st.write(f"{delta:+d}% → {pesos(p)} | margen {m:,.1f}%")
-with s2:
-    st.write("**Comisión app de 0% a 30% (paso 5%)**")
-    for com in range(0, 31, 5):
-        m = (combo_price - (sum_cost + packaging + other_var + combo_price*(com/100.0))) / combo_price * 100 if combo_price>0 else 0
-        st.write(f"{com}% → margen {m:,.1f}%")
-
-# =========================
-# Comparativo simple con competencia (opcional)
-# =========================
-with st.expander("📊 Referencia rápida vs competencia (opcional)"):
-    if comp_df.empty:
-        st.info("No tengo datos de competencia en el CSV.")
-    else:
-        # competencia comparable: misma subcategoría si existe, si no toda la categoría
-        mask_comp = pd.Series(True, index=comp_df.index)
-        if cat_col and cat_sel != "(todas)":
-            mask_comp &= comp_df[cat_col].astype(str).str.strip() == str(cat_sel).strip()
-        if subcat_col and subcat_sel != "(todas)":
-            mask_comp &= comp_df[subcat_col].astype(str).str.strip() == str(subcat_sel).strip()
-        ref_df = comp_df.loc[mask_comp, [brand_col, name_col, price_col]].copy() if brand_col else comp_df.loc[mask_comp, [name_col, price_col]].copy()
-        ref_df.rename(columns={brand_col: "Competidor", name_col: "Producto", price_col: "Precio (MXN)"}, inplace=True)
-        if ref_df.empty:
-            st.info("No hay referencias bajo estos filtros.")
-        else:
-            st.dataframe(ref_df.sort_values("Precio (MXN)").assign(**{"Precio (MXN)": lambda d: d["Precio (MXN)"].map(pesos)}),
-                         use_container_width=True)
-
-# =========================
-# Exportar combo
-# =========================
+# Exportar
 st.markdown("---")
-combo_name = st.text_input("Nombre del combo", value="Combo El Chal")
-prep_time = st.number_input("Tiempo objetivo de preparación (min)", min_value=0, value=10, step=1)
-export_cols = ["Producto","Cantidad","Precio","Costo","Subtotal Precio","Subtotal Costo"]
-export_payload = {
-    "combo": combo_name,
-    "items": combo_df[export_cols].to_dict(orient="records"),
-    "suma_precios_lista": round(sum_price, 2),
-    "suma_costos": round(sum_cost, 2),
+export_name = st.session_state.get("work_combo_name","Combo")
+payload = {
+    "combo": export_name,
+    "base_precios": base_col_name,
+    "items": work_df.to_dict(orient="records"),
+    "suma_precios_base": round(sum_price, 2),
+    "suma_costos_estimados": round(sum_cost, 2),
+    "suma_precios_minimos": round(sum_min, 2),
+    "parametros": {
+        "comision_app_pct": app_commission,
+        "empaque_mxn": packaging,
+        "otros_costos_mxn": other_var,
+        "modo_precio": modo_precio,
+        "descuento_pct": desc if modo_precio == "Descuento vs base" else None,
+        "margen_objetivo_pct": target_margin if modo_precio == "Margen objetivo" else None,
+        "enforce_min": enforce_min
+    },
     "precio_combo": round(combo_price, 2),
-    "costo_app": round(commission_cost, 2),
-    "costo_empaque": round(packaging, 2),
-    "otros_costos": round(other_var, 2),
     "costo_total_combo": round(total_cost_combo, 2),
     "margen_abs": round(margin_abs, 2),
-    "margen_pct": round(margin_pct, 2),
-    "descuento_vs_lista_pct": round(discount_vs_list, 2),
-    "prep_time_min": int(prep_time)
+    "margen_pct": round(margin_pct, 2)
 }
 st.download_button(
     "📥 Descargar combo (.json)",
-    data=pd.Series(export_payload).to_json(orient="values", force_ascii=False),
-    file_name=f"combo_{combo_name.replace(' ','_')}.json",
+    data=json.dumps(payload, ensure_ascii=False, indent=2),
+    file_name=f"combo_{export_name.replace(' ','_')}.json",
     mime="application/json"
 )
 
-st.success("Listo. ¡Juega con descuentos, margen objetivo y costos para afinar combos rentables!")
-
+st.success("Listo. La IA te dará propuestas distintas en cada tanda; puedes aplicarlas, ajustarlas y exportarlas.")
